@@ -1,1 +1,328 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <DHT.h>
+#include <HardwareSerial.h>
+
+// === Calibration Mode ===
+#define CALIBRATION_MODE false
+
+// === Pin Definitions ===
+#define RELAY_PIN 25
+#define SOIL_PIN 34
+#define VOLT_PIN 35
+#define CURR_PIN 32
+#define DHTPIN 4
+#define DHTTYPE DHT11
+#define VIB_PIN 26
+
+// === GSM Serial ===
+HardwareSerial sim800(2);  // RX2=16, TX2=17
+
+// === LCD ===
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// === DHT ===
+DHT dht(DHTPIN, DHTTYPE);
+
+// === Calibration Factors ===
+float soilDry = 4095;
+float soilWet = 1200;
+float voltageCal = 1261.11;
+float currentCal = 3.0;
+
+// === Thresholds ===
+float SOIL_THRESHOLD = 20.0;
+float VOLT_MIN = 180.0;
+float VOLT_MAX = 250.0;
+float CURR_MIN = 0.15;
+float CURR_MAX = 4.00;
+
+// === Flags ===
+bool motorState = false;
+unsigned long lastCheck = 0;
+unsigned long lastDHTRead = 0;
+unsigned long lastSwitchTime = 0;
+int screenState = 0;  // 0 = main, 1 = temp/hum
+String incoming = "";
+
+// === Variables ===
+float soil = 0.0, volt = 0.0, curr = 0.0, temp = 0.0, hum = 0.0;
+unsigned long lastVibTime = 0;
+bool vibTriggered = false;
+
+// === SMS Function ===
+void sendSMS(String msg) {
+  sim800.println("AT+CMGF=1");
+  delay(300);
+  sim800.println("AT+CMGS=\"+91xxxxxxxxxx\""); // 🔹 Replace with your phone number
+  delay(300);
+  sim800.print(msg);
+  sim800.write(26);  // Ctrl+Z
+  delay(1000);
+}
+
+// === Soil Moisture ===
+float readSoil() {
+  int val = analogRead(SOIL_PIN);
+  val = constrain(val, soilWet, soilDry);
+  float percent = map(val, soilDry, soilWet, 0, 100);
+  return percent;
+}
+
+// === Voltage ===
+float readVoltage() {
+  const int samples = 1000;
+  float maxValue = 0, minValue = 4095;
+  for (int i = 0; i < samples; i++) {
+    int val = analogRead(VOLT_PIN);
+    if (val > maxValue) maxValue = val;
+    if (val < minValue) minValue = val;
+    delayMicroseconds(100);
+  }
+  float peakToPeak = maxValue - minValue;
+  float voltage = (peakToPeak / 2.0) * (3.3 / 4095.0);
+  float acRMS = voltage * 0.707 * voltageCal;
+  if (acRMS < 10.0) acRMS = 0.0;
+  return acRMS;
+}
+
+// === Current ===
+float readCurrent() {
+  const int samples = 500;
+  long sum = 0;
+  for (int i = 0; i < samples; i++) {
+    int adc = analogRead(CURR_PIN);
+    sum += (adc - 2048) * (adc - 2048);
+    delayMicroseconds(200);
+  }
+  float rms = sqrt(sum / samples);
+  float current = (rms / 4095.0) * 3.3 * currentCal;
+  return current;
+}
+
+// === Fade Effect ===
+void fadeTransition() {
+  for (int fade = 0; fade < 3; fade++) {
+    lcd.backlight();
+    delay(100);
+  }
+  lcd.clear();
+}
+
+// === LCD Display ===
+void showMainScreen() {
+  fadeTransition();
+  lcd.setCursor(0, 0);
+  lcd.print("V:");
+  lcd.print(volt, 0);
+  lcd.print(" I:");
+  lcd.print(curr, 1);
+
+  lcd.setCursor(0, 1);
+  lcd.print("Soil:");
+  lcd.print(soil, 0);
+  lcd.print("% ");
+  lcd.print("M:");
+  lcd.print(motorState ? "ON" : "OFF");
+}
+
+void showTempHumidityScreen() {
+  fadeTransition();
+  lcd.setCursor(0, 0);
+  lcd.print("Temp:");
+  lcd.print(temp, 1);
+  lcd.print((char)223);
+  lcd.print("C");
+
+  lcd.setCursor(0, 1);
+  lcd.print("Hum :");
+  lcd.print(hum, 0);
+  lcd.print("%");
+  delay(2000);
+}
+
+
+// === Motor Control ===
+void motorOn() {
+  digitalWrite(RELAY_PIN, LOW);
+  motorState = true;
+  sendSMS("MOTOR TURNED ON");
+}
+
+void motorOff(String reason = "") {
+  digitalWrite(RELAY_PIN, HIGH);
+  motorState = false;
+  if (reason == "")
+    sendSMS("MOTOR TURNED OFF");
+  else
+    sendSMS("MOTOR TURNED OFF (" + reason + ")");
+}
+
+// === SMS Command Check ===
+void checkSMS() {
+  while (sim800.available()) {
+    char c = sim800.read();
+    Serial.write(c);
+    incoming += c;
+
+    if (c == '\n') {
+      incoming.trim();
+
+      // New SMS received
+      if (incoming.startsWith("+CMTI")) {
+        int index = incoming.substring(incoming.indexOf(",") + 1).toInt();
+        sim800.println("AT+CMGF=1");
+        delay(300);
+        sim800.print("AT+CMGR=");
+        sim800.println(index);
+        delay(5000);
+      }
+
+      // SMS Content Read
+      else if (incoming.startsWith("+CMGR")) {
+        String msg = "";
+        unsigned long timeout = millis();
+        while (millis() - timeout < 2000) {
+          if (sim800.available()) {
+            char c2 = sim800.read();
+            Serial.write(c2);
+            msg += c2;
+          }
+        }
+
+        msg.trim();
+        msg.toUpperCase();
+        Serial.println("\n[Parsed Message]: " + msg);
+
+        if (msg.indexOf("MOTOR ON") != -1) {
+          motorOn();
+        } 
+        else if (msg.indexOf("MOTOR OFF") != -1) {
+          motorOff();
+        } 
+        else if (msg.indexOf("STATUS") != -1) {
+          float soil = readSoil();
+          float volt = readVoltage();
+          float curr = readCurrent();
+          float temp = dht.readTemperature();
+          float hum = dht.readHumidity();
+          String reply = "STATUS:\nSoil:" + String(soil, 0) +
+                         "%\nVolt:" + String(volt, 0) +
+                         "V\nCurr:" + String(curr, 2) +
+                         "A\nTemp:" + String(temp, 1) +
+                         "C\nMotor:" + (motorState ? "ON" : "OFF");
+          sendSMS(reply);
+        }
+
+        sim800.print("AT+CMGD=1,4"); // Delete all messages
+      }
+
+      incoming = "";
+    }
+  }
+}
+
+// === Setup ===
+void setup() {
+  Serial.begin(9600);
+  sim800.begin(9600, SERIAL_8N1, 16, 17);
+  lcd.init();
+  lcd.backlight();
+  dht.begin();
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(VIB_PIN, INPUT);
+  digitalWrite(RELAY_PIN, HIGH);
+  motorState = false;
+
+  sendSMS(" Smart Motor Controller Ready");
+  sim800.println("AT+CMGF=1");
+  delay(300);
+  sim800.println("AT+CNMI=1,1,0,0,0");
+  delay(300);
+
+  Serial.println("=== System Ready ===");
+
+  lcd.setCursor(0, 0);
+  lcd.print("Smart Controller");
+  lcd.setCursor(0, 1);
+  lcd.print("Initializing...");
+  delay(2000);
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("Powered by");
+  lcd.setCursor(0, 1);
+  lcd.print("Embed X");
+  delay(2000);
+  lcd.clear();
+}
+
+// === Loop ===
+void loop() {
+  checkSMS();
+
+  if (millis() - lastCheck >= 5000) {
+  lastCheck = millis();
+
+  soil = readSoil();
+  volt = readVoltage();
+  curr = readCurrent();
+  temp = dht.readTemperature();
+  hum = dht.readHumidity();
+  int vib = digitalRead(VIB_PIN);
+
+
+    
+    // === Auto OFF when vibration detected ===
+    int vibState = digitalRead(VIB_PIN);
+
+
+  if (vibState == LOW && (millis() - lastVibTime > 1000)) {
+      lastVibTime = millis();
+      if (!vibTriggered) {
+        vibTriggered = true;
+        Serial.println("⚠ Vibration Detected!");
+        if (motorState) Serial.println("Vibration Detected (Fault)");
+      }
+    } else if (vibState == HIGH) {
+      vibTriggered = false;
+      Serial.println("No vibration detected");
+    }
+
+
+    // === Protection Conditions ===
+    if (!motorState && soil < SOIL_THRESHOLD && volt > VOLT_MIN) {
+     
+      Serial.println(" Soil Dry (" + String(soil, 0) + "%). Pls Turn On Motor");
+    }
+
+    if (motorState && soil > (SOIL_THRESHOLD + 10))
+      Serial.println("Soil Moisture (" + String(soil, 0) + "%)");
+
+    if (motorState && volt < VOLT_MIN)
+      Serial.println("Low Voltage (" + String(volt, 0) + "V)");
+    if (motorState && volt > VOLT_MAX)
+      Serial.println("Over Voltage (" + String(volt, 0) + "V)");
+    
+    // === LCD switching (every 8 sec) ===
+  if (millis() - lastSwitchTime > 8000) {
+    lastSwitchTime = millis();
+    screenState = !screenState;
+    if (screenState == 0) showMainScreen();
+    else showTempHumidityScreen();
+  }
+
+  // === Serial Debug ===
+  Serial.print("V: "); Serial.print(volt, 1);
+  Serial.print(" | I: "); Serial.print(curr, 2);
+  Serial.print(" | Soil: "); Serial.print(soil, 0);
+  Serial.print("% | Temp: "); Serial.print(temp, 1);
+  Serial.print(" | Hum: "); Serial.print(hum, 0);
+  Serial.print("% | Motor: "); Serial.println(motorState ? "ON" : "OFF");
+
+  delay(200);
+}
+  }
+  
 
